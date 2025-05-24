@@ -1,0 +1,148 @@
+sequenceDiagram
+    participant Writer as Writer Process
+    participant Reader as Reader Process
+    participant MS as Manifest Store
+    participant OS as Object Storage
+    participant State as DB State
+    participant CAS as CAS Operation
+    
+    Note over Writer,CAS: SlateDB Manifest Management Flow - Source Function Mapping
+    
+    Note over Writer,Reader: Database Initialization
+    
+    Writer->>+MS: db::open() for write
+    Note right of MS: src/manifest_store.rs::ManifestStore::new()
+    
+    MS->>+OS: Read latest manifest
+    Note right of OS: List manifest/ directory<br/>Find highest numbered manifest
+    
+    alt No manifest exists (new database)
+        OS-->>MS: No manifest found
+        MS->>MS: Create initial manifest
+        Note right of MS: manifest_id: 0, writer_epoch: 0
+        
+        MS->>+CAS: Write initial manifest with CAS
+        Note right of CAS: If-None-Match condition
+        CAS->>+OS: PUT manifest/00000000000000000000.manifest
+        Note right of OS: Atomic write with precondition
+        OS-->>-CAS: Manifest created successfully
+        CAS-->>-MS: Initial manifest written
+        
+    else Existing manifest found
+        OS-->>-MS: Latest manifest content
+        
+        MS->>MS: Parse manifest and increment writer_epoch
+        Note right of MS: Prevent zombie writers<br/>New epoch = current + 1
+        
+        MS->>+CAS: Update manifest with new epoch
+        Note right of CAS: Compare-and-swap on manifest_id
+        CAS->>+OS: PUT manifest/00000000000000000001.manifest
+        Note right of OS: If-Match: previous manifest_id
+        
+        alt CAS succeeds
+            OS-->>CAS: Manifest updated successfully
+            CAS-->>-MS: New epoch established
+        else CAS fails (another writer active)
+            OS-->>CAS: Precondition failed
+            CAS-->>MS: ManifestVersionExists error
+            MS-->>Writer: SlateDBError::ManifestVersionExists
+        end
+    end
+    
+    MS->>+State: Load DB state from manifest
+    Note right of State: src/db_state.rs::DbState::from_manifest()
+    State->>State: Initialize L0 SSTs, sorted runs, epochs
+    State-->>-MS: DB state loaded
+    MS-->>-Writer: Database opened successfully
+    
+    par Reader Process
+        Reader->>+MS: db::open() for read
+        Note right of MS: Read-only access, no epoch increment
+        
+        MS->>+OS: Read latest manifest
+        OS-->>-MS: Current manifest content
+        
+        MS->>+State: Load read-only DB state
+        State-->>-MS: Read state loaded
+        MS-->>-Reader: Read-only database opened
+    end
+    
+    Note over Writer,CAS: Runtime Manifest Updates
+    
+    Note over Writer: MemTable flush triggers manifest update
+    Writer->>+MS: Update manifest with new L0 SST
+    Note right of MS: src/manifest_store.rs::update_manifest()
+    
+    MS->>MS: Increment manifest_id
+    Note right of MS: manifest_id += 1
+    
+    MS->>MS: Add new L0 SST to manifest
+    Note right of MS: Update l0_ssts list, wal_id_last_seen
+    
+    MS->>+CAS: Write updated manifest
+    Note right of CAS: Atomic update with version check
+    CAS->>+OS: PUT manifest/00000000000000000002.manifest
+    Note right of OS: If-Match: current manifest_id
+    
+    alt CAS succeeds
+        OS-->>CAS: New manifest written
+        CAS-->>-MS: Manifest updated successfully
+        MS->>+State: Update in-memory state
+        State-->>-MS: State synchronized
+        MS-->>-Writer: L0 SST registered
+        
+    else CAS fails (conflict detected)
+        OS-->>CAS: Precondition failed
+        CAS-->>MS: Concurrent modification detected
+        MS->>MS: Retry with latest manifest
+        Note right of MS: Reload and retry update
+    end
+    
+    Note over Writer: Compaction triggers manifest update
+    Writer->>+MS: Update manifest after compaction
+    Note right of MS: Remove old SSTs, add new SSTs
+    
+    MS->>MS: Increment manifest_id and update SST lists
+    Note right of MS: Update l0_ssts, sorted_runs, wal_id_last_compacted
+    
+    MS->>+CAS: Write compaction manifest
+    CAS->>+OS: PUT manifest/00000000000000000003.manifest
+    
+    alt CAS succeeds
+        OS-->>CAS: Compaction manifest written
+        CAS-->>-MS: Manifest updated
+        MS->>+State: Update state with compaction results
+        State-->>-MS: State synchronized
+        MS-->>-Writer: Compaction committed
+        
+    else CAS fails
+        OS-->>CAS: Precondition failed
+        CAS-->>MS: Retry compaction manifest update
+    end
+    
+    Note over Writer,CAS: Manifest Recovery Process
+    
+    Note over Writer: Process restart scenario
+    Writer->>+MS: db::open() after restart
+    
+    MS->>+OS: Scan manifest directory
+    Note right of OS: List all manifest files
+    OS-->>-MS: All manifest files found
+    
+    MS->>MS: Find latest manifest by ID
+    Note right of MS: Parse filenames, find max manifest_id
+    
+    MS->>+OS: Read latest manifest
+    OS-->>-MS: Latest manifest content
+    
+    MS->>+State: Reconstruct DB state
+    Note right of State: Rebuild L0 SSTs, sorted runs from manifest
+    
+    State->>State: Validate SST references
+    Note right of State: Ensure all referenced SSTs exist
+    
+    State-->>-MS: DB state reconstructed
+    MS-->>-Writer: Database recovered successfully
+    
+    Note over Writer,CAS: Manifest Properties:<br/>- Atomic updates via CAS operations<br/>- Sequential numbering for ordering<br/>- Writer epoch fencing for consistency<br/>- Complete database state snapshot<br/>- Garbage collection coordination<br/><br/>Key Functions:<br/>- src/manifest_store.rs: ManifestStore, update_manifest()<br/>- src/db_state.rs: DbState management<br/>- Object store CAS operations for atomicity<br/>- src/db.rs: db::open() initialization
+
