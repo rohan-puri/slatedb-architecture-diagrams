@@ -1,0 +1,142 @@
+sequenceDiagram
+    participant Timer as GC Timer
+    participant GC as Garbage Collector
+    participant Manifest as Manifest Store
+    participant OS as Object Storage
+    participant Config as GC Config
+    participant Snapshots as Active Snapshots
+    
+    Note over Timer,Snapshots: SlateDB Garbage Collection Flow - Source Function Mapping
+    
+    Note over Timer: GC triggered by poll_interval timer
+    Timer->>+GC: Start garbage collection cycle
+    Note right of GC: src/garbage_collector.rs::GarbageCollector::run()
+    
+    GC->>+Config: Read GC configuration
+    Note right of Config: min_age, poll_interval for each file type
+    Config-->>-GC: GC policies loaded
+    
+    Note over GC: Three file types cleaned independently:<br/>1. Old Manifests<br/>2. Old WAL SSTs<br/>3. Old L0 SSTs
+    
+    par Manifest Cleanup
+        GC->>+Manifest: Get current manifest and snapshots
+        Note right of Manifest: src/manifest_store.rs::read_manifest()
+        Manifest-->>-GC: Current manifest_id and active snapshots
+        
+        GC->>+OS: List all manifest files
+        Note right of OS: List manifest/ directory
+        OS-->>-GC: All manifest files with timestamps
+        
+        GC->>GC: Filter manifests for deletion
+        Note right of GC: Rules:<br/>- Older than manifest.min_age<br/>- Not current manifest<br/>- Not referenced by snapshots
+        
+        loop For each old manifest
+            alt Manifest is eligible for deletion
+                GC->>+OS: Delete old manifest
+                Note right of OS: DELETE manifest/00000000000000000XXX.manifest
+                OS-->>-GC: Manifest deleted
+            else Manifest still needed
+                Note over GC: Skip manifest (referenced by snapshot)
+            end
+        end
+        
+    and WAL SST Cleanup
+        GC->>+Manifest: Get wal_id_last_compacted
+        Note right of Manifest: Last WAL ID that was compacted to L0
+        Manifest-->>-GC: WAL compaction watermark
+        
+        GC->>+OS: List all WAL SST files
+        Note right of OS: List wal/ directory
+        OS-->>-GC: All WAL SSTs with metadata
+        
+        GC->>GC: Filter WAL SSTs for deletion
+        Note right of GC: Rules:<br/>- Older than wal.min_age<br/>- WAL ID < wal_id_last_compacted<br/>- Data already in L0
+        
+        loop For each old WAL SST
+            alt WAL SST is eligible for deletion
+                GC->>+OS: Delete old WAL SST
+                Note right of OS: DELETE wal/00000000000000000XXX.sst
+                OS-->>-GC: WAL SST deleted
+            else WAL SST still needed
+                Note over GC: Skip WAL SST (not yet compacted)
+            end
+        end
+        
+    and L0 SST Cleanup
+        GC->>+Manifest: Get current L0 SSTs and snapshots
+        Note right of Manifest: Referenced L0 SSTs in current state
+        Manifest->>+Snapshots: Get snapshot references
+        Note right of Snapshots: SSTs referenced by active snapshots
+        Snapshots-->>-Manifest: Snapshot SST references
+        Manifest-->>-GC: Protected L0 SST list
+        
+        GC->>+OS: List all L0 SST files
+        Note right of OS: List levels/ directory for L0 SSTs
+        OS-->>-GC: All L0 SSTs with metadata
+        
+        GC->>GC: Filter L0 SSTs for deletion
+        Note right of GC: Rules:<br/>- Older than l0.min_age<br/>- Not in current manifest<br/>- Not referenced by snapshots<br/>- Already compacted to L1+
+        
+        loop For each old L0 SST
+            alt L0 SST is eligible for deletion
+                GC->>+OS: Delete old L0 SST
+                Note right of OS: DELETE levels/ULID.sst
+                OS-->>-GC: L0 SST deleted
+            else L0 SST still needed
+                Note over GC: Skip L0 SST (still referenced)
+            end
+        end
+    end
+    
+    GC->>GC: Collect garbage collection metrics
+    Note right of GC: Track deleted files, freed space, errors
+    
+    alt GC errors occurred
+        GC->>GC: Log errors and continue
+        Note right of GC: Non-fatal errors don't stop GC
+    end
+    
+    GC->>Timer: Schedule next GC cycle
+    Note right of Timer: Sleep for poll_interval duration
+    
+    GC-->>-Timer: GC cycle completed
+    
+    Note over Timer,Snapshots: Advanced GC Scenarios
+    
+    Note over GC: Snapshot-aware cleanup
+    GC->>+Snapshots: Check long-running snapshots
+    Note right of Snapshots: Snapshots prevent file deletion
+    
+    alt Long-running snapshot detected
+        Snapshots-->>GC: Snapshot blocking cleanup
+        Note over GC: Log warning about blocked cleanup<br/>Files accumulate until snapshot released
+    else No blocking snapshots
+        Snapshots-->>-GC: Normal cleanup can proceed
+    end
+    
+    Note over GC: Manifest compaction cleanup
+    GC->>+Manifest: Check for compaction completion
+    Note right of Manifest: Compaction updates wal_id_last_compacted
+    
+    alt Compaction recently completed
+        Manifest-->>GC: New WAL SSTs eligible for cleanup
+        Note over GC: More aggressive WAL cleanup possible
+    else No recent compaction
+        Manifest-->>-GC: Standard cleanup thresholds apply
+    end
+    
+    Note over GC: Error handling and retry
+    alt Object store error during deletion
+        GC->>OS: Retry failed deletions
+        Note right of OS: Exponential backoff for retries
+        
+        alt Retry succeeds
+            OS-->>GC: File deleted on retry
+        else Retry fails
+            OS-->>GC: Log error and continue
+            Note over GC: Don't block GC for individual failures
+        end
+    end
+    
+    Note over Timer,Snapshots: GC Configuration Per File Type:<br/>- manifest: min_age=1h, poll_interval=10m<br/>- wal_sst: min_age=30m, poll_interval=5m<br/>- l0_sst: min_age=1h, poll_interval=10m<br/><br/>Key Functions:<br/>- src/garbage_collector.rs: GarbageCollector::run(), cleanup logic<br/>- src/manifest_store.rs: manifest and snapshot queries<br/>- Object store LIST and DELETE operations<br/>- Configurable min_age and poll_interval per file type
+

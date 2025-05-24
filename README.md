@@ -15,6 +15,8 @@ I have used claude 4.0 to generate mermaid code as well as images
 3. **[Read Path Flow](diagrams/03-read-path-flow.mmd)** - Read path flow
 4. **[Compaction Flow](diagrams/04-compaction-flow.mmd)** - Compaction flow
 5. **[Manifest Management](diagrams/05-manifest-management.mmd)** - Manifest Management flow
+6. **[Garbage collection](diagrams/06-garbage-collection.mmd)** - Garbage Collection flow
+
 ## How to Use
 
 ### View/Edit Diagrams
