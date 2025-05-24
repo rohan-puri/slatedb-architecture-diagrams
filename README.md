@@ -13,6 +13,7 @@ I have used claude 4.0 to generate mermaid code as well as images
 1. **[System Architecture](diagrams/01-system-architecture.mmd)** - Overall component structure and data flow
 2. **[Write Path Flow](diagrams/02-write-path-flow.mmd)** - Write path flow
 3. **[Read Path Flow](diagrams/03-read-path-flow.mmd)** - Read path flow
+4. **[Compaction Flow](diagrams/04-compaction-flow.mmd)** - Compaction flow
 
 ## How to Use
 

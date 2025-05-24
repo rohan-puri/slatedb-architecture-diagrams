@@ -1,0 +1,123 @@
+sequenceDiagram
+    participant Trigger as Compaction Trigger
+    participant Orchestrator as Compaction Orchestrator
+    participant Scheduler as Compaction Scheduler
+    participant Executor as Compaction Executor
+    participant Manifest as Manifest Store
+    participant OS as Object Storage
+    participant GC as Garbage Collector
+    
+    Note over Trigger,GC: SlateDB Compaction Flow - Source Function Mapping
+    
+    Note over Trigger: Compaction triggered by:<br/>- L0 SST count threshold<br/>- Manual trigger<br/>- Background timer
+    
+    Trigger->>+Orchestrator: Start compaction cycle
+    Note right of Orchestrator: src/compactor.rs::Compactor::run()
+    
+    Orchestrator->>+Scheduler: Check for compaction tasks
+    Note right of Scheduler: src/compactor.rs::CompactionScheduler::schedule()
+    
+    Scheduler->>+Manifest: Read current database state
+    Note right of Manifest: src/manifest_store.rs::read_manifest()
+    Manifest-->>-Scheduler: Current L0 SSTs and Sorted Runs state
+    
+    Scheduler->>Scheduler: Analyze compaction needs
+    Note right of Scheduler: Size-tiered compaction strategy
+    
+    alt No compaction needed
+        Scheduler-->>Orchestrator: No tasks scheduled
+        Orchestrator->>Orchestrator: Sleep until next cycle
+    else L0 to L1 compaction needed
+        Scheduler->>Scheduler: Select L0 SSTs for compaction
+        Note right of Scheduler: Choose SSTs based on size/age
+        
+        Scheduler->>+Executor: Schedule L0→L1 compaction task
+        Note right of Executor: src/compactor.rs::CompactionExecutor::execute()
+        
+        Executor->>+OS: Read selected L0 SSTs
+        Note right of OS: Read from levels/ directory
+        
+        loop For each selected L0 SST
+            OS-->>Executor: L0 SST data
+        end
+        
+        Executor->>+OS: Read overlapping L1 SSTs (if any)
+        Note right of OS: Find SSTs with overlapping key ranges
+        OS-->>-Executor: L1 SST data
+        
+        Executor->>Executor: Merge sort all SST data
+        Note right of Executor: Sort-merge with deduplication<br/>Keep newest values for duplicate keys
+        
+        Executor->>+OS: Write new L1 SSTs
+        Note right of OS: Write to levels/ directory<br/>Format: ULID.sst
+        
+        loop For each output SST
+            OS-->>Executor: New L1 SST written
+        end
+        
+        Executor->>+Manifest: Update manifest with compaction results
+        Note right of Manifest: Add new L1 SSTs, mark old SSTs for deletion
+        
+        Manifest->>+OS: Write new manifest with CAS
+        Note right of OS: manifest/00000000000000000XXX.manifest<br/>Atomic update with version check
+        OS-->>-Manifest: Manifest updated successfully
+        Manifest-->>-Executor: Compaction committed
+        
+        Executor-->>-Scheduler: L0→L1 compaction completed
+        
+    else L1+ to L2+ compaction needed
+        Scheduler->>Scheduler: Select Sorted Runs for compaction
+        Note right of Scheduler: Check level_max_runs thresholds
+        
+        Scheduler->>+Executor: Schedule LN→LN+1 compaction task
+        
+        Executor->>+OS: Read source level SSTs
+        Note right of OS: Read overlapping SSTs from source level
+        OS-->>Executor: Source SST data
+        
+        Executor->>+OS: Read target level SSTs
+        Note right of OS: Read overlapping SSTs from target level
+        OS-->>-Executor: Target SST data
+        
+        Executor->>Executor: Merge sort all data
+        Note right of Executor: Multi-way merge with range partitioning
+        
+        Executor->>+OS: Write new target level SSTs
+        Note right of OS: Write range-partitioned SSTs
+        OS-->>-Executor: New SSTs written
+        
+        Executor->>+Manifest: Update manifest with results
+        Manifest->>+OS: Write new manifest with CAS
+        OS-->>-Manifest: Manifest updated
+        Manifest-->>-Executor: Compaction committed
+        
+        Executor-->>-Scheduler: LN→LN+1 compaction completed
+    end
+    
+    Scheduler-->>-Orchestrator: Compaction cycle finished
+    
+    Orchestrator->>+GC: Trigger cleanup of old SSTs
+    Note right of GC: src/garbage_collector.rs::collect()
+    
+    GC->>+Manifest: Read manifest for eligible SSTs
+    Manifest-->>-GC: List of SSTs marked for deletion
+    
+    GC->>+OS: Delete old SSTs
+    Note right of OS: Remove compacted L0 SSTs and old L1+ SSTs
+    
+    loop For each old SST
+        OS-->>GC: SST deleted
+    end
+    
+    GC-->>-Orchestrator: Cleanup completed
+    
+    Orchestrator-->>-Trigger: Compaction cycle completed
+    
+    Note over Trigger: Check backpressure relief
+    alt L0 count now < l0_max_ssts
+        Note over Trigger: Resume blocked writes
+        Note right of Trigger: src/db.rs::maybe_apply_backpressure()
+    end
+    
+    Note over Trigger,GC: Compaction Strategy (Size-Tiered):<br/>- Compact when level has too many runs<br/>- Merge overlapping key ranges<br/>- Maintain sorted order within levels<br/>- Remove duplicate/deleted keys<br/><br/>Key Functions:<br/>- src/compactor.rs: Compactor, CompactionScheduler, CompactionExecutor<br/>- src/manifest_store.rs: manifest updates with CAS<br/>- src/garbage_collector.rs: cleanup old files<br/>- src/table_store.rs: SST reading/writing operations
+
