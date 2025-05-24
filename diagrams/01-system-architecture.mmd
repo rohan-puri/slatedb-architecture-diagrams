@@ -1,0 +1,77 @@
+graph TB
+    Client[Client Application]
+    
+    subgraph SlateDB["SlateDB Engine"]
+        API[Database API]
+        
+        subgraph Memory["In-Memory Components"]
+            WAL[Write-Ahead Log<br/>Mutable WAL]
+            ImmutableWAL[Immutable WAL<br/>Being Flushed]
+            MemTable[MemTable<br/>In-Memory Sorted]
+            FrozenMemTable[Frozen MemTable<br/>Being Flushed]
+        end
+        
+        subgraph Cache["Caching Layer"]
+            BlockCache[Block Cache]
+            BloomFilters[Bloom Filters]
+            IndexCache[Index Cache]
+        end
+        
+        Compactor[Compaction Engine]
+        GC[Garbage Collector]
+        Manifest[Manifest Manager]
+    end
+    
+    subgraph ObjectStore["Object Storage (S3/GCS/ABS)"]
+        subgraph WALDir["wal/ directory"]
+            WALSSTs[WAL SSTs]
+        end
+        
+        subgraph CompactedDir["compacted/ directory"]
+            L0SSTs[L0 SSTs<br/>Recent MemTables<br/>May Overlap]
+            
+            subgraph SortedRuns["Sorted Runs"]
+                SR1[Sorted Run 1<br/>Range Partitioned]
+                SR2[Sorted Run 2<br/>Larger Ranges]
+                SRN[Sorted Run N<br/>Largest Ranges]
+            end
+        end
+        
+        ManifestFiles[Manifest Files]
+    end
+    
+    Client --> API
+    API --> WAL
+    API --> MemTable
+    API --> Cache
+    WAL --> ImmutableWAL
+    MemTable --> FrozenMemTable
+    ImmutableWAL -.-> WALSSTs
+    FrozenMemTable -.-> L0SSTs
+    L0SSTs -.-> SR1
+    Compactor --> SR1
+    Compactor --> SR2
+    Compactor --> SRN
+    SR1 -.-> SR2
+    SR2 -.-> SRN
+    Manifest --> ManifestFiles
+    GC -.-> WALSSTs
+    GC -.-> L0SSTs
+    Cache --> L0SSTs
+    Cache --> SR1
+    Cache --> SR2
+    
+    %% Legend
+    subgraph Legend["🔍 Legend"]
+        SolidArrow[Direct/Synchronous Operations]
+        DottedArrow[Async/Background Operations]
+        SolidArrow --> DottedArrow
+        SolidArrow -.-> DottedArrow
+    end
+    
+    style Memory fill:#e8f4fd
+    style Cache fill:#fff2cc
+    style ObjectStore fill:#e8f5e8
+    style SortedRuns fill:#d4edda
+    style Legend fill:#f0f0f0
+
