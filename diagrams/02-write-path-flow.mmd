@@ -1,0 +1,98 @@
+sequenceDiagram
+    participant Client
+    participant API as SlateDB API
+    participant WAL as Mutable WAL
+    participant IWAL as Immutable WAL
+    participant MT as MemTable
+    participant IMT as Immutable MemTable
+    participant OS as Object Storage
+    participant Manifest
+    
+    Note over Client,Manifest: Complete Write Path Flow - Source Function Mapping
+    
+    Client->>+API: db.put(key, value) / db.write_with_options(batch, options)
+    Note right of API: src/db.rs::write_with_options()
+    
+    Note over API: Check WriteOptions.await_durable
+    Note right of API: options.await_durable boolean
+    
+    API->>+WAL: WriteBatch -> WriteBatchMsg::WriteBatch
+    Note right of WAL: src/mem_table.rs::WritableKVTable::put()
+    WAL->>WAL: table.put_or_delete(key, value, attrs)
+    Note right of WAL: SkipMap<Bytes, ValueWithAttributes>
+    WAL-->>-API: WriteBatchRequest completed
+    
+    alt await_durable = false
+        API-->>Client: Future (instant response)
+    else await_durable = true
+        Note over API: Hold Future until WAL durable
+        Note right of API: current_table.await_durable().await
+    end
+    
+    Note over WAL: Accumulate writes until flush_ms or size threshold
+    Note right of WAL: Controlled by DbOptions::flush_ms
+    
+    WAL->>+IWAL: Freeze WAL -> ImmutableWal::new(table)
+    Note right of IWAL: src/mem_table.rs::ImmutableWal
+    Note over WAL,IWAL: Create new WritableKVTable for incoming writes
+    
+    IWAL->>+OS: async write WAL SST via TableStore
+    Note right of OS: WAL flush thread writes to wal/ directory
+    Note right of OS: Format: 00000000000000000XXX.sst
+    OS-->>-IWAL: WAL SST written successfully
+    
+    IWAL->>+MT: Insert WAL data -> WritableKVTable
+    Note right of MT: src/mem_table.rs::WritableKVTable
+    MT-->>-IWAL: Data inserted into MemTable SkipMap
+    
+    Note over API: Notify WAL durable via WatchableOnceCell
+    alt await_durable = true
+        IWAL-->>API: table.notify_durable(Ok(()))
+        API-->>Client: Future resolves
+        Note right of API: src/mem_table.rs::KVTable::await_durable()
+    end
+    
+    Note over MT: Accumulate data until l0_sst_size_bytes
+    Note right of MT: Controlled by DbOptions::l0_sst_size_bytes
+    
+    MT->>+IMT: Freeze MemTable -> ImmutableMemtable::new()
+    Note right of IMT: src/mem_table.rs::ImmutableMemtable
+    Note over MT,IMT: Create new WritableKVTable
+    
+    IMT->>+OS: async write L0 SST via TableStore
+    Note right of OS: MemTable flush thread writes to levels/
+    Note right of OS: Format: ULID.sst
+    OS-->>-IMT: L0 SST written successfully
+    
+    IMT->>+Manifest: Update manifest via ManifestStore
+    Note right of Manifest: src/manifest_store.rs update operations
+    Manifest->>+OS: write new manifest with CAS
+    Note right of OS: manifest/00000000000000000XXX.manifest
+    Note right of OS: Increment manifest_id atomically
+    OS-->>-Manifest: Manifest updated with CAS success
+    Manifest-->>-IMT: Manifest update confirmed
+    
+    Note over Manifest: Check L0 SST count vs l0_max_ssts
+    Note right of Manifest: DbOptions::l0_max_ssts threshold
+    
+    alt L0 count > l0_max_ssts
+        Note over API: Apply backpressure via maybe_apply_backpressure()
+        Note right of API: src/db.rs::maybe_apply_backpressure()
+    else L0 count within limits
+        Note over API: Continue normal operation
+    end
+    
+    par Garbage Collection
+        Manifest->>OS: GarbageCollector deletes old WAL SSTs
+        Note right of OS: Delete WAL older than wal_id_last_compacted
+        Note right of OS: src/garbage_collector.rs
+    and Compaction Trigger
+        Note over Manifest: Compactor::schedule_compaction()
+        Note right of Manifest: src/compactor.rs
+    end
+    
+    IMT-->>-MT: notify_flush_to_l0(Ok(()))
+    Note right of IMT: src/mem_table.rs::ImmutableMemtable::notify_flush_to_l0()
+    
+    Note over Client,Manifest: Key Functions:<br/>- src/db.rs: put(), write_with_options(), maybe_apply_backpressure()<br/>- src/mem_table.rs: WritableKVTable, ImmutableWal, ImmutableMemtable<br/>- src/manifest_store.rs: manifest updates with CAS<br/>- src/garbage_collector.rs: cleanup old files<br/>- src/compactor.rs: background compaction
+
