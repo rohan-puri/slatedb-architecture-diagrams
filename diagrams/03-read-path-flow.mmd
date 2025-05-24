@@ -1,0 +1,140 @@
+sequenceDiagram
+    participant Client
+    participant API as SlateDB API
+    participant WAL as Mutable WAL
+    participant IWAL as Immutable WAL
+    participant MT as MemTable
+    participant IMT as Immutable MemTable
+    participant L0 as L0 SSTs
+    participant SR as Sorted Runs (L1+)
+    participant Cache as Block Cache
+    participant OS as Object Storage
+    
+    Note over Client,OS: Complete Read Path Flow - Source Function Mapping
+    
+    Client->>+API: db.get(key) / db.get_with_options(key, options)
+    Note right of API: src/db.rs::get_with_options()
+    
+    Note over API: Check ReadLevel option
+    Note right of API: ReadLevel::Committed vs Uncommitted
+    
+    alt ReadLevel::Uncommitted
+        API->>+WAL: Search mutable WAL table
+        Note right of WAL: src/mem_table.rs::WritableKVTable::get()
+        WAL->>WAL: table.map.get(key)
+        Note right of WAL: SkipMap<Bytes, ValueWithAttributes>
+        
+        alt Key found in WAL
+            WAL-->>API: Return value (most recent)
+            API-->>Client: Value from WAL
+        else Key not found
+            WAL-->>-API: Key not found, continue search
+            
+            API->>+IWAL: Search immutable WAL tables
+            Note right of IWAL: src/mem_table.rs::ImmutableWal::get()
+            
+            loop For each immutable WAL (newest first)
+                IWAL->>IWAL: table.map.get(key)
+                alt Key found
+                    IWAL-->>API: Return value
+                    API-->>Client: Value from immutable WAL
+                else Continue to next WAL
+                    Note over IWAL: Check next immutable WAL
+                end
+            end
+            IWAL-->>-API: Key not found in WAL tables
+        end
+    end
+    
+    Note over API: Search committed data (standard read path)
+    
+    API->>+MT: Search mutable MemTable
+    Note right of MT: src/mem_table.rs::WritableKVTable::get()
+    MT->>MT: table.map.get(key)
+    
+    alt Key found in MemTable
+        MT-->>API: Return value (most recent)
+        API-->>Client: Value from MemTable
+    else Key not found
+        MT-->>-API: Key not found, continue search
+        
+        API->>+IMT: Search immutable MemTables
+        Note right of IMT: src/mem_table.rs::ImmutableMemtable::get()
+        
+        loop For each immutable MemTable (newest first)
+            IMT->>IMT: table.map.get(key)
+            alt Key found
+                IMT-->>API: Return value
+                API-->>Client: Value from immutable MemTable
+            else Continue to next MemTable
+                Note over IMT: Check next immutable MemTable
+            end
+        end
+        IMT-->>-API: Key not found in MemTables
+    end
+    
+    API->>+L0: Search L0 SSTables (newest to oldest)
+    Note right of L0: src/db.rs::search_l0_ssts()
+    
+    loop For each L0 SST (newest first)
+        L0->>+Cache: Check bloom filter in cache
+        Note right of Cache: src/cached_object_store.rs
+        
+        alt Bloom filter indicates key might exist
+            Cache-->>L0: Might contain key
+            L0->>+OS: Read SST blocks
+            Note right of OS: TableStore::get() from levels/ directory
+            OS->>Cache: Cache blocks for future reads
+            OS-->>-L0: SST data blocks
+            
+            L0->>L0: Binary search within SST
+            alt Key found
+                L0-->>API: Return value
+                API-->>Client: Value from L0 SST
+            else Key not in this SST
+                Note over L0: Continue to next L0 SST
+            end
+        else Bloom filter indicates key not present
+            Cache-->>L0: Key definitely not in SST
+            Note over L0: Skip this SST, continue to next
+        end
+    end
+    L0-->>-API: Key not found in L0 SSTables
+    
+    API->>+SR: Search Sorted Runs (L1, L2, L3...)
+    Note right of SR: src/db.rs::search_sorted_runs()
+    
+    loop For each level (L1, L2, L3... newest first)
+        SR->>SR: Find SST with range covering key
+        Note right of SR: SortedRun::find_sst_with_range_covering_key()
+        
+        alt SST range covers key
+            SR->>+Cache: Check bloom filter
+            alt Bloom filter indicates key might exist
+                Cache-->>SR: Might contain key
+                SR->>+OS: Read SST blocks
+                Note right of OS: TableStore::get() from levels/ directory
+                OS->>Cache: Cache blocks for future reads
+                OS-->>-SR: SST data blocks
+                
+                SR->>SR: Binary search within SST
+                alt Key found
+                    SR-->>API: Return value
+                    API-->>Client: Value from Sorted Run
+                else Key not in this SST
+                    Note over SR: Continue to next level
+                end
+            else Bloom filter indicates key not present
+                Cache-->>SR: Key definitely not in SST
+                Note over SR: Skip this level, continue to next
+            end
+        else No SST range covers key
+            Note over SR: Skip this level, continue to next
+        end
+    end
+    SR-->>-API: Key not found in any Sorted Runs
+    
+    API-->>-Client: Key not found (None)
+    
+    Note over Client,OS: Read Order (newest to oldest):<br/>1. Mutable WAL (if Uncommitted)<br/>2. Immutable WALs (if Uncommitted)<br/>3. Mutable MemTable<br/>4. Immutable MemTables<br/>5. L0 SSTables<br/>6. Sorted Runs (L1, L2, L3...)<br/><br/>Key Functions:<br/>- src/db.rs: get_with_options(), search_l0_ssts(), search_sorted_runs()<br/>- src/mem_table.rs: WritableKVTable::get(), ImmutableMemtable::get()<br/>- src/cached_object_store.rs: bloom filter and block caching<br/>- src/table_store.rs: SST reading and parsing
+
