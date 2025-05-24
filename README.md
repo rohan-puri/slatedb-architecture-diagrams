@@ -11,7 +11,7 @@ I have used claude 4.0 to generate mermaid code as well as images
 ## Available Diagrams
 
 1. **[System Architecture](diagrams/01-system-architecture.mmd)** - Overall component structure and data flow
-2. **[Write Path Flow](diagrams/01-write-path-flow.mmd)** - Write path flow
+2. **[Write Path Flow](diagrams/02-write-path-flow.mmd)** - Write path flow
 
 ## How to Use
 
