@@ -1,0 +1,185 @@
+sequenceDiagram
+    participant Writer1 as Writer Process 1
+    participant Writer2 as Writer Process 2
+    participant MS as Manifest Store
+    participant OS as Object Storage
+    participant CAS as CAS Operation
+    participant Epoch as Writer Epoch
+    
+    Note over Writer1,Epoch: SlateDB Single Writer Enforcement Flow
+    
+    Note over Writer1,Writer2: Initial Database Setup
+    
+    Writer1->>+MS: db open for write
+    Note right of MS: src/db.rs open, src/manifest_store.rs
+    
+    MS->>+OS: Read current manifest
+    Note right of OS: GET manifest file
+    
+    alt No existing manifest
+        OS-->>MS: No manifest found
+        MS->>MS: Initialize with writer_epoch = 0
+        Note right of MS: First writer gets epoch 0
+        
+    else Existing manifest found
+        OS-->>MS: Current manifest with writer_epoch = N
+        MS->>MS: Calculate new epoch = N + 1
+        Note right of MS: Increment epoch to fence previous writers
+    end
+    
+    OS-->>-MS: Manifest read complete
+    
+    MS->>+Epoch: Set writer_epoch = N + 1
+    Note right of Epoch: src/manifest_store.rs update_writer_epoch
+    Epoch-->>-MS: Writer epoch set
+    
+    MS->>+CAS: Write manifest with new epoch
+    Note right of CAS: Compare-and-swap operation
+    CAS->>+OS: PUT manifest with If-Match condition
+    Note right of OS: Atomic write with precondition check
+    
+    alt CAS succeeds
+        OS-->>CAS: Manifest written successfully
+        CAS-->>MS: New epoch established
+        MS-->>Writer1: Database opened, writer active
+        
+    else CAS fails
+        OS-->>CAS: Precondition failed
+        CAS-->>MS: ManifestVersionExists error
+        MS-->>Writer1: SlateDBError ManifestVersionExists
+    end
+    
+    OS-->>-CAS: Operation complete
+    CAS-->>-MS: CAS complete
+    MS-->>-Writer1: Open complete
+    
+    Note over Writer1: Writer 1 is now the active writer
+    
+    par Concurrent Writer Attempt
+        Note over Writer2: Concurrent writer attempts to open
+        Writer2->>+MS: db open concurrent attempt
+        
+        MS->>+OS: Read current manifest
+        OS-->>-MS: Manifest with writer_epoch = N + 1
+        
+        MS->>MS: Calculate new epoch = N + 2
+        Note right of MS: Attempt to increment epoch
+        
+        MS->>+CAS: Write manifest with epoch N + 2
+        CAS->>+OS: PUT manifest with If-Match
+        
+        alt Writer1 still active
+            OS-->>CAS: Precondition failed
+            Note right of OS: Manifest changed by Writer1 operations
+            CAS-->>MS: CAS failed - another writer active
+            MS-->>Writer2: SlateDBError ManifestVersionExists
+            Note over Writer2: Writer2 fails to acquire lock
+            
+        else Writer1 crashed
+            OS-->>CAS: CAS succeeds
+            CAS-->>MS: New epoch N + 2 established
+            MS-->>Writer2: Database opened, Writer2 now active
+            Note over Writer2: Writer2 becomes new active writer
+        end
+        
+        OS-->>-CAS: CAS operation complete
+        CAS-->>-MS: Result returned
+        MS-->>-Writer2: Open attempt complete
+    end
+    
+    Note over Writer1,Epoch: Active Writer Operations with Epoch Validation
+    
+    Writer1->>+MS: Write operation MemTable flush
+    Note right of MS: src/db.rs write_with_options
+    
+    MS->>MS: Check current writer_epoch
+    Note right of MS: Validate this writer still has the lock
+    
+    alt Writer epoch matches expected
+        MS->>MS: Prepare manifest update
+        Note right of MS: Add new L0 SST, increment manifest_id
+        
+        MS->>+CAS: Update manifest with epoch validation
+        Note right of CAS: Include writer_epoch in CAS condition
+        CAS->>+OS: PUT manifest with If-Match conditions
+        Note right of OS: Check both manifest_id AND writer_epoch
+        
+        alt CAS succeeds
+            OS-->>CAS: Manifest updated successfully
+            CAS-->>MS: Write operation committed
+            MS-->>Writer1: Operation successful
+            
+        else CAS fails zombie detected
+            OS-->>CAS: Precondition failed
+            Note right of OS: Another writer has taken over
+            CAS-->>MS: Zombie writer detected
+            MS->>MS: Mark writer as zombie
+            Note right of MS: Set internal zombie flag
+            MS-->>Writer1: SlateDBError WriterEpochExpired
+        end
+        
+        OS-->>-CAS: CAS complete
+        CAS-->>-MS: Update complete
+        
+    else Writer epoch mismatch
+        MS->>MS: Detect zombie state
+        Note right of MS: Local epoch != manifest epoch
+        MS-->>Writer1: SlateDBError WriterEpochExpired
+    end
+    
+    MS-->>-Writer1: Write operation complete
+    
+    Note over Writer1,Epoch: Zombie Writer Detection and Handling
+    
+    alt Writer1 becomes zombie
+        Writer1->>+MS: Subsequent write attempt
+        Note right of MS: Writer1 does not know it is a zombie
+        
+        MS->>MS: Check writer_epoch in manifest
+        Note right of MS: Compare local epoch with manifest
+        
+        MS->>+OS: Read current manifest
+        OS-->>-MS: Manifest with newer writer_epoch
+        
+        MS->>MS: Detect epoch mismatch
+        Note right of MS: Local epoch < manifest epoch
+        
+        MS-->>-Writer1: SlateDBError WriterEpochExpired
+        Note over Writer1: Writer1 must stop all operations
+        
+        Writer1->>Writer1: Handle zombie state
+        Note right of Writer1: Close database, stop all writes
+    end
+    
+    Note over Writer1,Epoch: Writer Failure and Recovery
+    
+    Note over Writer1: Simulate Writer1 crash or network partition
+    
+    Writer2->>+MS: db open after Writer1 failure
+    Note right of MS: Writer2 attempts to become new writer
+    
+    MS->>+OS: Read current manifest
+    OS-->>-MS: Manifest with stale writer_epoch
+    
+    MS->>MS: Increment writer_epoch = N + 2
+    Note right of MS: Fence the failed Writer1
+    
+    MS->>+CAS: Write manifest with new epoch
+    CAS->>+OS: PUT manifest with CAS
+    
+    alt No interference from Writer1
+        OS-->>CAS: CAS succeeds
+        CAS-->>MS: Writer2 now active
+        MS-->>Writer2: Database opened successfully
+        Note over Writer2: Writer2 is now the active writer
+        
+    else Writer1 recovers concurrently
+        OS-->>CAS: CAS fails due to interference
+        CAS-->>MS: Retry needed
+        Note over MS: Exponential backoff retry
+    end
+    
+    OS-->>-CAS: Final CAS complete
+    CAS-->>-MS: Recovery complete
+    MS-->>-Writer2: Recovery operation complete
+
