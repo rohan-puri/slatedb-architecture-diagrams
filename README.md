@@ -39,3 +39,6 @@ Apache 2.0 - Feel free to use these diagrams in your own documentation!
 
 Found an error or want to add a diagram? PRs welcome!
 
+## NOTE
+Used AI for this work and did manual fixes where it failed.
+
